@@ -1,0 +1,257 @@
+# ---------------------------------------------------------------------------
+# Aplicacion de restaurante: entorno de DESARROLLO
+# ---------------------------------------------------------------------------
+# Uso:
+#   docker compose -f deploy/docker-compose.dev.yml --env-file .env up -d
+#
+# QUE HACE DIFERENTE A DESARROLLO
+# -------------------------------
+#  - Publica los puertos de la API (8000), la web (3000) y Authentik (9000)
+#    para entrar por el navegador sin pasar por Caddy.
+#  - No usa HTTPS: en desarrollo el certificado no aporta nada y obliga a
+#    hacer una excepcion en el navegador.
+#  - Monta el codigo fuente como volumen: se edita en el host y se ve al
+#    instante. En produccion el codigo va DENTRO de la imagen.
+#
+# LO QUE NUNCA DEBE COPIARSE A PRODUCCION
+# ----------------------------------------
+#  - Los puertos publicados. En produccion solo Caddy esta expuesto.
+#  - Los volumenes de codigo. En produccion el codigo va en la imagen.
+#
+# ---------------------------------------------------------------------------
+
+name: restaurante-dev
+
+services:
+
+  # -------------------------------------------------------------------------
+  # PostgreSQL.
+  #
+  # DOS ROLES, Y NO UNO
+  # -------------------
+  # `POSTGRES_USER` es el rol de ARRANQUE: la imagen oficial ejecuta
+  # `initdb --username="$POSTGRES_USER"` y ese rol nace superusuario. Solo
+  # se usa para crear la base y para las tareas administrativas. La
+  # aplicacion NUNCA conecta con el.
+  #
+  # El rol de la aplicacion (`DB_USERNAME`) lo crea
+  # `deploy/postgres/inicializar-rol.sh` al inicializar el volumen, con
+  # NOSUPERUSER y NOBYPASSRLS explicitos. Le da la propiedad de la base
+  # para que las migraciones de Laravel puedan crear el esquema.
+  #
+  # POR QUE IMPORTA: la documentacion de PostgreSQL 18 dice que los
+  # superusuarios "always bypass the row security system", y que
+  # `FORCE ROW LEVEL SECURITY` sujeta solo al DUENO de la tabla, no al
+  # superusuario. Con un solo rol las politicas no se aplicarian y el
+  # aislamiento entre empresas seria decorativo. Ver docs/03.
+  # -------------------------------------------------------------------------
+  postgres:
+    image: postgres:18.6
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_DATABASE:-restaurante}
+      POSTGRES_USER: ${DB_ADMIN_USERNAME:-restaurante_admin}
+      POSTGRES_PASSWORD: ${DB_ADMIN_PASSWORD:?falta DB_ADMIN_PASSWORD en el .env}
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+      # Rol con el que conecta la aplicacion. Lo crea el script de arranque.
+      APP_DB_ROLE: ${DB_USERNAME:-restaurante_app}
+      APP_DB_PASSWORD: ${DB_PASSWORD:?falta DB_PASSWORD en el .env}
+    volumes:
+      - postgres-datos:/var/lib/postgresql/data
+      - ./postgres/inicializar-rol.sh:/docker-entrypoint-initdb.d/inicializar-rol.sh:ro
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME:-restaurante_app} -d ${DB_DATABASE:-restaurante}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # -------------------------------------------------------------------------
+  # Redis: reloj de cocina, cache y colas.
+  #
+  # El reloj de cocina es lo que justifica Redis en este proyecto: la pantalla
+  # consulta los tiempos cada 3 segundos y no tiene sentido ir a la base.
+  # -------------------------------------------------------------------------
+  redis:
+    image: redis:8.8.3-alpine
+    restart: unless-stopped
+    # Sin persistencia a proposito: el reloj es volatile y se reconstruye desde
+    # la base con `restaurante:reconstruir-reloj`. Guardar en disco un dato que
+    # se puede regenerar solo hace que Redis tarde mas en reiniciar.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "127.0.0.1:6379:6379"
+
+  # -------------------------------------------------------------------------
+  # API (Laravel).
+  # -------------------------------------------------------------------------
+  api:
+    image: restaurante-api-dev
+    build:
+      context: ../api
+      dockerfile: ../deploy/api/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      APP_NAME: "Aplicacion de restaurante"
+      APP_ENV: local
+      APP_DEBUG: "true"
+      APP_KEY: ${APP_KEY:?falta APP_KEY en el .env}
+      APP_URL: ${APP_URL:-http://localhost:8000}
+
+      DB_CONNECTION: pgsql
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_DATABASE: ${DB_DATABASE:-restaurante}
+      DB_USERNAME: ${DB_USERNAME:-restaurante_app}
+      DB_PASSWORD: ${DB_PASSWORD}
+
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      CACHE_STORE: redis
+      QUEUE_CONNECTION: redis
+      # La sesion va a Redis y no a la base: la base tiene que responder a la
+      # pantalla de cocina rapido y no conviene mezclarla con eso.
+      SESSION_DRIVER: redis
+      SESSION_SECURE_COOKIE: "false"
+
+      CORRER_MIGRACIONES: "true"
+    volumes:
+      - ../api:/var/www/html
+    ports:
+      - "8000:8080"
+
+  # -------------------------------------------------------------------------
+  # Trabajador de colas.
+  #
+  # Corre el MISMO contenedor que la API con otro comando: si el worker se
+  # demora, las peticiones siguen contestandose.
+  # -------------------------------------------------------------------------
+  cola:
+    image: restaurante-api-dev
+    build:
+      context: ../api
+      dockerfile: ../deploy/api/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_started
+      redis:
+        condition: service_started
+    command: ["php", "artisan", "queue:work", "--sleep=3", "--tries=3", "--max-time=3600"]
+    environment:
+      APP_ENV: local
+      APP_KEY: ${APP_KEY}
+      DB_CONNECTION: pgsql
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_DATABASE: ${DB_DATABASE:-restaurante}
+      DB_USERNAME: ${DB_USERNAME:-restaurante_app}
+      DB_PASSWORD: ${DB_PASSWORD}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      CACHE_STORE: redis
+      QUEUE_CONNECTION: redis
+      SESSION_DRIVER: redis
+    volumes:
+      - ../api:/var/www/html
+
+  # -------------------------------------------------------------------------
+  # Interfaz (Nuxt, modo servidor).
+  # -------------------------------------------------------------------------
+  web:
+    image: restaurante-web-dev
+    build:
+      context: ../web
+      dockerfile: ../deploy/web/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - api
+    environment:
+      NUXT_API_BASE: http://api:8080
+      NUXT_PUBLIC_BASE: ${APP_WEB_URL:-http://localhost:3000}
+      NUXT_SESSION_PASSWORD: ${NUXT_SESSION_PASSWORD:?falta NUXT_SESSION_PASSWORD en el .env}
+      NUXT_AUTHENTIK_ISSUER: ${AUTHENTIK_ISSUER:?falta AUTHENTIK_ISSUER en el .env}
+      NUXT_AUTHENTIK_CLIENT_ID: ${AUTHENTIK_CLIENT_ID:?falta AUTHENTIK_CLIENT_ID en el .env}
+      NUXT_AUTHENTIK_CLIENT_SECRET: ${AUTHENTIK_CLIENT_SECRET:?falta AUTHENTIK_CLIENT_SECRET en el .env}
+      NUXT_AUTHENTIK_REDIRECT_URI: ${AUTHENTIK_REDIRECT_URI:?falta AUTHENTIK_REDIRECT_URI en el .env}
+      NUXT_AUTHENTIK_GRUPO_ADMIN: ${AUTHENTIK_GRUPO_ADMIN:-restaurante-administradores}
+      NUXT_INTERVALO_COCINA_MS: ${COCINA_INTERVALO_REFRESCO_MS:-3000}
+    ports:
+      - "3000:3000"
+
+  # -------------------------------------------------------------------------
+  # Authentik (identidad).
+  #
+  # Desde la version 2025.10 Authentik NO usa Redis y son tres servicios:
+  # `postgresql`, `server` y `worker`. `server` y `worker` usan LA MISMA imagen
+  # con distinto `command`. No existe una imagen `worker` aparte.
+  #
+  # Authentik tiene su propia base de datos, separada de la de la aplicacion.
+  # -------------------------------------------------------------------------
+  authentik-postgres:
+    image: postgres:18.6
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${AUTHENTIK_POSTGRESQL__NAME:-authentik}
+      POSTGRES_USER: ${AUTHENTIK_POSTGRESQL__USER:-authentik}
+      POSTGRES_PASSWORD: ${AUTHENTIK_POSTGRESQL__PASSWORD:?falta AUTHENTIK_POSTGRESQL__PASSWORD en el .env}
+    volumes:
+      - authentik-postgres-datos:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AUTHENTIK_POSTGRESQL__USER:-authentik}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  authentik-server:
+    image: ghcr.io/goauthentik/server:2025.10
+    restart: unless-stopped
+    command: server
+    depends_on:
+      authentik-postgres:
+        condition: service_healthy
+    environment:
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY:?falta AUTHENTIK_SECRET_KEY en el .env}
+      AUTHENTIK_POSTGRESQL__HOST: authentik-postgres
+      AUTHENTIK_POSTGRESQL__USER: ${AUTHENTIK_POSTGRESQL__USER:-authentik}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${AUTHENTIK_POSTGRESQL__PASSWORD}
+      AUTHENTIK_POSTGRESQL__NAME: ${AUTHENTIK_POSTGRESQL__NAME:-authentik}
+      AUTHENTIK_BOOTSTRAP__EMAIL: ${AUTHENTIK_BOOTSTRAP__EMAIL:-admin@ejemplo.cl}
+      AUTHENTIK_BOOTSTRAP__PASSWORD: ${AUTHENTIK_BOOTSTRAP__PASSWORD:?falta AUTHENTIK_BOOTSTRAP__PASSWORD en el .env}
+      AUTHENTIK_BOOTSTRAP__TOKEN: ${AUTHENTIK_BOOTSTRAP__TOKEN:?falta AUTHENTIK_BOOTSTRAP__TOKEN en el .env}
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+    volumes:
+      - authentik-media:/media
+    ports:
+      # Solo en la interfaz local del host. En produccion esto NO se publica.
+      - "9000:9000"
+
+  authentik-worker:
+    image: ghcr.io/goauthentik/server:2025.10
+    restart: unless-stopped
+    command: worker
+    depends_on:
+      authentik-postgres:
+        condition: service_healthy
+    environment:
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
+      AUTHENTIK_POSTGRESQL__HOST: authentik-postgres
+      AUTHENTIK_POSTGRESQL__USER: ${AUTHENTIK_POSTGRESQL__USER:-authentik}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${AUTHENTIK_POSTGRESQL__PASSWORD}
+      AUTHENTIK_POSTGRESQL__NAME: ${AUTHENTIK_POSTGRESQL__NAME:-authentik}
+      AUTHENTIK_BOOTSTRAP__EMAIL: ${AUTHENTIK_BOOTSTRAP__EMAIL:-admin@ejemplo.cl}
+      AUTHENTIK_BOOTSTRAP__PASSWORD: ${AUTHENTIK_BOOTSTRAP__PASSWORD}
+      AUTHENTIK_BOOTSTRAP__TOKEN: ${AUTHENTIK_BOOTSTRAP__TOKEN}
+    volumes:
+      - authentik-media:/media
+
+volumes:
+  postgres-datos:
+  authentik-postgres-datos:
+  authentik-media:

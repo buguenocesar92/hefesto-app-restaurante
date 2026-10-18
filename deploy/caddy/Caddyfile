@@ -1,0 +1,42 @@
+# ---------------------------------------------------------------------------
+# Caddy: unico servicio con puerto publico.
+# ---------------------------------------------------------------------------
+# REEMPLAZAR LOS DOMINIOS DE EJEMPLO antes de levantar en produccion:
+#   restaurante.ejemplo.cl  ->  el dominio real del cliente
+# ---------------------------------------------------------------------------
+
+restaurante.ejemplo.cl {
+	encode zstd gzip
+
+	# Cabeceras de seguridad.
+	#
+	# La CSP va en modo `report-only`: si se activa en `enforce` y falta un
+	# recurso, el salon queda en blanco y el mesero no puede cobrar. Es una
+	# decision consciente: primero se observa que reporta el navegador y despues
+	# se activa. Ver docs/07-SEGURIDAD.md.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "geolocation=(), microphone=(), camera=()"
+		Content-Security-Policy-Report-Only "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+		-Server
+	}
+
+	# La API NO se expone. Todo pasa por el contenedor web (BFF), que es quien
+	# reenvia la sesion y el token CSRF. Exponerla permitiria que alguien la
+	# llamara sin sesion y saltarse el BFF entero.
+	handle /api/* {
+		reverse_proxy api:8080
+	}
+
+	handle {
+		reverse_proxy web:3000
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}
